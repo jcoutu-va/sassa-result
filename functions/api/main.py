@@ -19,8 +19,13 @@ Admin endpoints (require Firebase ID token + admin_users entry):
 
 import os
 import re
+import csv
+import io
+import hashlib
+import secrets
 import logging
-from flask import Flask, jsonify, request
+from datetime import datetime, timedelta
+from flask import Flask, jsonify, request, Response
 from google.cloud import secretmanager
 from google.cloud import storage as gcs_storage
 from google.cloud.sql.connector import Connector
@@ -132,6 +137,36 @@ def _require_admin():
     return email, None
 
 
+# ── API key helpers ───────────────────────────────────────────────────────────
+
+def _generate_api_key():
+    """Return (raw_key, sha256_hex). Only raw_key is shown to the user; only
+    the hash is stored in the database."""
+    raw = "ssk_" + secrets.token_hex(32)
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
+    return raw, key_hash
+
+
+def _require_api_key():
+    """Validate an ApiKey token from the Authorization header.
+
+    Returns (key_id, None) on success or (None, flask_response) on failure.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("ApiKey "):
+        return None, (jsonify({"error": "Unauthorized"}), 401)
+    raw_key = auth[7:]
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id FROM api_keys WHERE key_hash = :h AND expires_at > NOW()"),
+            {"h": key_hash},
+        ).fetchone()
+    if not row:
+        return None, (jsonify({"error": "Invalid or expired API key"}), 401)
+    return row.id, None
+
+
 # ── Admin endpoints ───────────────────────────────────────────────────────────
 
 @app.route("/api/admin/upload", methods=["POST", "OPTIONS"])
@@ -201,6 +236,58 @@ def add_admin_user():
         )
         conn.commit()
     return jsonify({"added": new_email})
+
+
+@app.route("/api/admin/api-keys", methods=["GET", "OPTIONS"])
+def list_api_keys():
+    if request.method == "OPTIONS":
+        return "", 204
+    email, err = _require_admin()
+    if err:
+        return err
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, label, created_by, created_at, expires_at "
+            "FROM api_keys WHERE expires_at > NOW() ORDER BY created_at DESC"
+        )).fetchall()
+    return jsonify([dict(r._mapping) for r in rows])
+
+
+@app.route("/api/admin/api-keys", methods=["POST"])
+def create_api_key():
+    email, err = _require_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    label = body.get("label", "").strip() or None
+    raw_key, key_hash = _generate_api_key()
+    expires_at = datetime.utcnow() + timedelta(days=30)
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "INSERT INTO api_keys (key_hash, label, created_by, expires_at) "
+            "VALUES (:h, :label, :by, :exp) RETURNING id, created_at, expires_at"
+        ), {"h": key_hash, "label": label, "by": email, "exp": expires_at}).fetchone()
+        conn.commit()
+    return jsonify({
+        "id":         row.id,
+        "key":        raw_key,
+        "label":      label,
+        "created_at": row.created_at.isoformat(),
+        "expires_at": row.expires_at.isoformat(),
+    })
+
+
+@app.route("/api/admin/api-keys/<int:key_id>", methods=["DELETE", "OPTIONS"])
+def revoke_api_key(key_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    email, err = _require_admin()
+    if err:
+        return err
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM api_keys WHERE id = :id"), {"id": key_id})
+        conn.commit()
+    return jsonify({"revoked": key_id})
 
 
 @app.route("/api/admin/users/<path:target_email>", methods=["DELETE", "OPTIONS"])
@@ -472,6 +559,118 @@ def get_competition_results(comp_id):
         "competition": dict(comp._mapping),
         "results": results,
     })
+
+
+# ── Batch endpoint (API key auth) ─────────────────────────────────────────────
+
+@app.route("/api/batch/best-times", methods=["POST", "OPTIONS"])
+def batch_best_times():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    _, err = _require_api_key()
+    if err:
+        return err
+
+    from_date = request.args.get("from", "").strip()
+    to_date   = request.args.get("to",   "").strip()
+    if not from_date or not to_date:
+        return jsonify({"error": "from and to query params required"}), 400
+
+    raw_csv = request.get_data(as_text=True)
+    reader  = csv.DictReader(io.StringIO(raw_csv))
+    if not {"ssc_id", "name"}.issubset(set(reader.fieldnames or [])):
+        return jsonify({"error": "CSV must have ssc_id and name columns"}), 400
+
+    input_rows = [
+        {"ssc_id": r["ssc_id"].strip(), "name": r["name"].strip()}
+        for r in reader
+        if r.get("ssc_id", "").strip()
+    ]
+    if not input_rows:
+        return jsonify({"error": "No rows in CSV"}), 400
+
+    ssc_ids    = [r["ssc_id"] for r in input_rows]
+    name_by_id = {r["ssc_id"]: r["name"] for r in input_rows}
+
+    # Build numbered IN-list params (works with SQLAlchemy text() + pg8000)
+    in_params   = {f"id{i}": v for i, v in enumerate(ssc_ids)}
+    in_clause   = ", ".join(f":id{i}" for i in range(len(ssc_ids)))
+
+    with engine.connect() as conn:
+        skaters = conn.execute(
+            text(f"SELECT id, code_pat, club_name FROM skaters WHERE code_pat IN ({in_clause})"),
+            in_params,
+        ).fetchall()
+
+        found = {s.code_pat: s for s in skaters}
+
+        if found:
+            result_params = {**in_params, "from_date": from_date, "to_date": to_date}
+            pb_rows = conn.execute(text(f"""
+                WITH ranked AS (
+                  SELECT
+                    s.code_pat,
+                    REGEXP_REPLACE(r.distance, ' Round [A-Za-z0-9]+', '') AS distance,
+                    c.track_type,
+                    r.time_ms,
+                    r.time_display,
+                    c.date AS achieved_on,
+                    c.name AS achieved_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY s.code_pat,
+                                   REGEXP_REPLACE(r.distance, ' Round [A-Za-z0-9]+', ''),
+                                   c.track_type
+                      ORDER BY r.time_ms
+                    ) AS rn
+                  FROM results r
+                  JOIN competitions c ON r.competition_id = c.id
+                  JOIN skaters s ON r.skater_id = s.id
+                  WHERE s.code_pat IN ({in_clause})
+                    AND r.is_valid_time = true
+                    AND r.qual_or_fin = 'Fin'
+                    AND c.date BETWEEN :from_date AND :to_date
+                )
+                SELECT code_pat, distance, track_type,
+                       time_display AS best_time, achieved_at, achieved_on
+                FROM ranked WHERE rn = 1
+                ORDER BY code_pat, track_type, distance
+            """), result_params).fetchall()
+        else:
+            pb_rows = []
+
+    pbs_by_id = {}
+    for r in pb_rows:
+        pbs_by_id.setdefault(r.code_pat, []).append(r)
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["ssc_id", "name", "club", "track_type", "distance",
+                     "best_time", "achieved_at", "achieved_on"])
+
+    for inp in input_rows:
+        sid    = inp["ssc_id"]
+        name   = inp["name"]
+        skater = found.get(sid)
+        rows   = pbs_by_id.get(sid, [])
+
+        if not skater or not rows:
+            writer.writerow([sid, name, "", "", "", "", "", ""])
+        else:
+            for r in rows:
+                writer.writerow([
+                    sid, name, skater.club_name or "",
+                    r.track_type, r.distance, r.best_time or "",
+                    r.achieved_at or "",
+                    r.achieved_on.isoformat() if r.achieved_on else "",
+                ])
+
+    filename = f"best-times-{from_date}-to-{to_date}.csv"
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 if __name__ == "__main__":

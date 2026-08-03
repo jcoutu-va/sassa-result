@@ -52,6 +52,18 @@ export const adminApi = {
   removeUser: (token, email) =>
     authFetch(`/api/admin/users/${encodeURIComponent(email)}`, token, { method: "DELETE" }),
 
+  getApiKeys: (token) => authFetch("/api/admin/api-keys", token),
+
+  createApiKey: (token, label) =>
+    authFetch("/api/admin/api-keys", token, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }),
+    }),
+
+  revokeApiKey: (token, id) =>
+    authFetch(`/api/admin/api-keys/${id}`, token, { method: "DELETE" }),
+
   uploadPat: async (token, file, trackType) => {
     const formData = new FormData();
     formData.append("file", file);

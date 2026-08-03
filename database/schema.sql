@@ -48,6 +48,18 @@ CREATE INDEX IF NOT EXISTS idx_results_valid        ON results(skater_id, distan
 CREATE INDEX IF NOT EXISTS idx_skaters_name         ON skaters(last_name, first_name);
 CREATE INDEX IF NOT EXISTS idx_competitions_season  ON competitions(season);
 
+-- API keys for programmatic access (30-day expiry)
+CREATE TABLE IF NOT EXISTS api_keys (
+    id          SERIAL PRIMARY KEY,
+    key_hash    VARCHAR(64) NOT NULL UNIQUE,  -- SHA-256 hex of raw key
+    label       TEXT,
+    created_by  TEXT        NOT NULL,         -- admin email
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    expires_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash    ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_expires ON api_keys(expires_at);
+
 -- View: best valid time per skater per distance (career)
 -- Distance normalization: "400 (100) Round A" → "400 (100)" etc.
 CREATE OR REPLACE VIEW best_times_career AS

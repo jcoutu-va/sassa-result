@@ -224,6 +224,180 @@ function UsersTab({ getToken, currentEmail }) {
   );
 }
 
+// ── API Keys tab ──────────────────────────────────────────────────────────────
+
+function ApiKeysTab({ getToken }) {
+  const [keys, setKeys] = useState(null);
+  const [error, setError] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [label, setLabel] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [newKey, setNewKey] = useState(null);
+  const [copied, setCopied] = useState(false);
+
+  async function load() {
+    try {
+      const token = await getToken();
+      setKeys(await adminApi.getApiKeys(token));
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function handleGenerate(e) {
+    e.preventDefault();
+    setGenerating(true);
+    setError(null);
+    try {
+      const token = await getToken();
+      const result = await adminApi.createApiKey(token, label.trim() || null);
+      setNewKey(result);
+      setLabel("");
+      setShowForm(false);
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function handleRevoke(id, keyLabel) {
+    if (!confirm(`Revoke key${keyLabel ? ` "${keyLabel}"` : ""}?`)) return;
+    try {
+      const token = await getToken();
+      await adminApi.revokeApiKey(token, id);
+      if (newKey?.id === id) setNewKey(null);
+      await load();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  function handleCopy() {
+    navigator.clipboard.writeText(newKey.key);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  if (keys === null && !error) return <p className="text-gray-400 text-sm">Loading…</p>;
+
+  return (
+    <div className="max-w-lg">
+      {error && <p className="text-red-600 text-sm mb-3">{error}</p>}
+
+      {newKey && (
+        <div className="mb-5 p-4 bg-brand-50 border border-brand-200 rounded-lg">
+          <p className="text-sm font-medium text-brand-800 mb-2">
+            New API key — copy it now, it won't be shown again.
+          </p>
+          <div className="flex items-center gap-2 mb-2">
+            <code className="flex-1 text-xs bg-white border border-brand-200 rounded px-3 py-2 font-mono break-all select-all">
+              {newKey.key}
+            </code>
+            <button
+              onClick={handleCopy}
+              className="shrink-0 px-3 py-2 text-xs font-medium bg-brand-700 text-white rounded hover:bg-brand-800 transition-colors"
+            >
+              {copied ? "Copied!" : "Copy"}
+            </button>
+          </div>
+          <p className="text-xs text-brand-600">
+            Expires {new Date(newKey.expires_at).toLocaleDateString("en-CA")}
+          </p>
+          <button
+            onClick={() => setNewKey(null)}
+            className="mt-2 text-xs text-brand-600 hover:underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {keys && keys.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden mb-5">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-500 uppercase text-xs tracking-wide">
+              <tr>
+                <th className="px-4 py-3 text-left">Label</th>
+                <th className="px-4 py-3 text-left hidden sm:table-cell">Created by</th>
+                <th className="px-4 py-3 text-left">Expires</th>
+                <th className="px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {keys.map((k) => (
+                <tr key={k.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-2.5 text-gray-800">
+                    {k.label || <span className="text-gray-400 italic">unlabeled</span>}
+                  </td>
+                  <td className="px-4 py-2.5 text-gray-400 text-xs hidden sm:table-cell">
+                    {k.created_by}
+                  </td>
+                  <td className="px-4 py-2.5 text-gray-500 text-xs">
+                    {new Date(k.expires_at).toLocaleDateString("en-CA")}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    <button
+                      onClick={() => handleRevoke(k.id, k.label)}
+                      className="text-red-500 hover:text-red-700 text-xs font-medium"
+                    >
+                      Revoke
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {keys?.length === 0 && !newKey && (
+        <p className="text-gray-400 text-sm mb-4">No active API keys.</p>
+      )}
+
+      {showForm ? (
+        <form onSubmit={handleGenerate} className="flex gap-2">
+          <input
+            type="text"
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            placeholder="Label (optional)"
+            autoFocus
+            className="flex-1 border border-gray-300 rounded px-3 py-2 text-sm
+                       focus:outline-none focus:ring-2 focus:ring-brand-600"
+          />
+          <button
+            type="submit"
+            disabled={generating}
+            className="px-4 py-2 bg-brand-700 text-white rounded text-sm font-medium
+                       hover:bg-brand-800 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {generating ? "Generating…" : "Generate"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setShowForm(false); setLabel(""); }}
+            className="px-4 py-2 border border-gray-300 rounded text-sm text-gray-600 hover:bg-gray-50"
+          >
+            Cancel
+          </button>
+        </form>
+      ) : (
+        <button
+          onClick={() => setShowForm(true)}
+          className="px-4 py-2 bg-brand-700 text-white rounded text-sm font-medium
+                     hover:bg-brand-800 transition-colors"
+        >
+          Generate Key
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function Admin() {
@@ -301,7 +475,7 @@ export default function Admin() {
 
       {/* Tabs */}
       <div className="flex gap-0 mb-6 border-b border-gray-200">
-        {[["upload", "Upload PAT"], ["users", "Manage Admins"]].map(([key, label]) => (
+        {[["upload", "Upload PAT"], ["users", "Manage Admins"], ["apikeys", "API Keys"]].map(([key, label]) => (
           <button
             key={key}
             onClick={() => setTab(key)}
@@ -316,10 +490,9 @@ export default function Admin() {
         ))}
       </div>
 
-      {tab === "upload" && <UploadTab getToken={getToken} />}
-      {tab === "users" && (
-        <UsersTab getToken={getToken} currentEmail={user.email?.toLowerCase()} />
-      )}
+      {tab === "upload"  && <UploadTab getToken={getToken} />}
+      {tab === "users"   && <UsersTab getToken={getToken} currentEmail={user.email?.toLowerCase()} />}
+      {tab === "apikeys" && <ApiKeysTab getToken={getToken} />}
     </div>
   );
 }
