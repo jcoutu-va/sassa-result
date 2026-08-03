@@ -60,7 +60,7 @@ Browser
 │   │       ├── Home.jsx               # Events + Athletes tabs
 │   │       ├── SkaterProfile.jsx      # Best times + all results
 │   │       ├── CompetitionResults.jsx # Full results for one event
-│   │       └── Admin.jsx              # Upload + user management
+│   │       └── Admin.jsx              # Upload, user management, API keys
 │   ├── public/
 │   │   └── logo.webp       # Speed Skating Sask logo
 │   ├── tailwind.config.js  # Brand green colour scale
@@ -110,7 +110,7 @@ cd functions/api
 pip install -r requirements.txt
 
 export GCP_PROJECT=sassa-odc
-export CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-db
+export CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-results-db
 export DB_NAME=skate_results
 export DB_USER=skate_app
 export DB_SECRET=skate-db-app-password
@@ -147,13 +147,13 @@ firebase deploy --only hosting
 ```bash
 cd functions/api
 
-gcloud builds submit --tag northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-repo/skate-api
+gcloud builds submit --tag northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-functions/skate-api
 
 gcloud run deploy skate-api \
-  --image northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-repo/skate-api \
+  --image northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-functions/skate-api \
   --region northamerica-northeast1 \
-  --set-env-vars GCP_PROJECT=sassa-odc,CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-db \
-  --add-cloudsql-instances sassa-odc:northamerica-northeast1:skate-db \
+  --set-env-vars GCP_PROJECT=sassa-odc,CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-results-db \
+  --add-cloudsql-instances sassa-odc:northamerica-northeast1:skate-results-db \
   --allow-unauthenticated
 ```
 
@@ -162,13 +162,13 @@ gcloud run deploy skate-api \
 ```bash
 cd functions/pat_processor
 
-gcloud builds submit --tag northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-repo/pat-processor
+gcloud builds submit --tag northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-functions/pat-processor
 
 gcloud run deploy pat-processor \
-  --image northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-repo/pat-processor \
+  --image northamerica-northeast1-docker.pkg.dev/sassa-odc/skate-functions/pat-processor \
   --region northamerica-northeast1 \
-  --set-env-vars GCP_PROJECT=sassa-odc,CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-db \
-  --add-cloudsql-instances sassa-odc:northamerica-northeast1:skate-db \
+  --set-env-vars GCP_PROJECT=sassa-odc,CLOUD_SQL_INSTANCE=sassa-odc:northamerica-northeast1:skate-results-db \
+  --add-cloudsql-instances sassa-odc:northamerica-northeast1:skate-results-db \
   --no-allow-unauthenticated
 ```
 
@@ -187,6 +187,14 @@ gcloud eventarc triggers create pat-upload-trigger \
 ### Database
 
 Run `database/schema.sql` then `database/grants.sql` once against a fresh Cloud SQL instance. Re-running is safe (all statements are `CREATE IF NOT EXISTS` / `CREATE OR REPLACE`).
+
+To apply schema changes to an existing instance without an interactive psql session, upload the SQL to GCS and use `gcloud sql import sql`:
+
+```bash
+gcloud storage cp migration.sql gs://sassa-odc-assets/migrations/migration.sql
+gcloud sql import sql skate-results-db gs://sassa-odc-assets/migrations/migration.sql \
+  --database=skate_results --project=sassa-odc
+```
 
 ---
 
@@ -218,7 +226,10 @@ GCPV (the timing software used by Speed Skate Canada) exports results as `.pat` 
 
 Base URL: `https://skate-api-232158332347.northamerica-northeast1.run.app`
 
-All responses are JSON. Admin endpoints require a Firebase ID token in the `Authorization: Bearer <token>` header.
+All responses are JSON. Two authentication schemes are in use:
+
+- **Firebase ID token** (`Authorization: Bearer <token>`) — required for admin UI endpoints (user management, PAT upload, API key management). Token is obtained via Firebase Auth (Google sign-in).
+- **API key** (`Authorization: ApiKey ssk_<key>`) — required for the batch export endpoint. Keys are generated in the Admin UI, valid for 30 days.
 
 ### Public endpoints
 
@@ -233,7 +244,7 @@ All responses are JSON. Admin endpoints require a Firebase ID token in the `Auth
 | GET | `/api/skaters/<code_pat>/best-times?from=&to=` | Best times within a custom date range (ISO dates) |
 | GET | `/api/skaters/<code_pat>/results` | All individual result rows for a skater |
 
-### Admin endpoints
+### Admin endpoints (Firebase ID token)
 
 | Method | Path | Description |
 |---|---|---|
@@ -241,6 +252,36 @@ All responses are JSON. Admin endpoints require a Firebase ID token in the `Auth
 | GET | `/api/admin/users` | List admin email addresses |
 | POST | `/api/admin/users` | Add an admin (`{"email": "…"}`) |
 | DELETE | `/api/admin/users/<email>` | Remove an admin |
+| GET | `/api/admin/api-keys` | List active API keys (label, created by, expiry) |
+| POST | `/api/admin/api-keys` | Generate a new 30-day API key. Body: `{"label": "optional"}`. Returns `{id, key, expires_at}` — **key is shown once only** |
+| DELETE | `/api/admin/api-keys/<id>` | Revoke a key immediately |
+
+### Batch export endpoint (API key)
+
+```
+POST /api/batch/best-times?from=YYYY-MM-DD&to=YYYY-MM-DD
+Authorization: ApiKey ssk_<key>
+Content-Type: text/csv
+```
+
+**Request body** — CSV with `ssc_id` and `name` columns:
+
+```
+ssc_id,name
+SK-AB1234,Jane Smith
+SK-CD5678,John Doe
+```
+
+**Response** — `text/csv` download, one row per (skater × track type × distance) PB in the date range. Skaters not found in the database, or with no results in the period, return a single row with just the input fields and blank time columns:
+
+```
+ssc_id,name,club,track_type,distance,best_time,achieved_at,achieved_on
+SK-AB1234,Jane Smith,Saskatoon SC,ST,500m,43.21,Prairie Opener,2024-10-19
+SK-AB1234,Jane Smith,Saskatoon SC,LT,500 Olympic Style (400),38.90,RSTM,2025-01-11
+SK-CD5678,John Doe,,,,,,
+```
+
+The filename is set to `best-times-{from}-to-{to}.csv`.
 
 ---
 
@@ -290,6 +331,17 @@ All responses are JSON. Admin endpoints require a Firebase ID token in the `Auth
 | `finish_code` | text | NULL = clean finish; else `DNF`, `DNS`, `P-xxx`, etc. |
 | `points` | numeric(8,2) | |
 | `is_valid_time` | boolean | True when finish_code is NULL and time_ms is not NULL |
+
+**`api_keys`**
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | serial PK | |
+| `key_hash` | varchar(64) | SHA-256 hex of the raw key — plaintext is never stored |
+| `label` | text | Optional human-readable label |
+| `created_by` | text | Admin email that generated the key |
+| `created_at` | timestamptz | |
+| `expires_at` | timestamptz | Always 30 days after creation |
 
 ### Views
 
