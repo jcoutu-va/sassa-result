@@ -1,0 +1,5 @@
+functions-framework==3.*
+google-cloud-storage
+google-cloud-secret-manager
+cloud-sql-python-connector[pg8000]
+pg8000

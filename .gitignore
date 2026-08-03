@@ -1,0 +1,26 @@
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Firebase
+.firebase/
+frontend/.firebaserc
+
+# PAT files (raw timing data, not source code)
+*.pat
+
+# Local extraction scripts (ad-hoc utilities)
+pat_extract.py
+pat_to_csv.ps1
+
+# Environment / secrets
+.env
+.env.*

@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "sassa-odc"
+  },
+  "targets": {
+    "sassa-odc": {
+      "hosting": {
+        "results": [
+          "sassa-results"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
