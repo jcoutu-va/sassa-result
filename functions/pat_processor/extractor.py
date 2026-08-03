@@ -73,8 +73,8 @@ def _parse_date(raw: str) -> date | None:
 
 
 def _derive_season(d: date) -> str:
-    """Oct-Dec -> season starting that year; Jan-Sep -> season starting prior year."""
-    if d.month >= 10:
+    """Jul-Dec -> season starting that year; Jan-Jun -> season starting prior year."""
+    if d.month >= 7:
         return f"{d.year}-{d.year + 1}"
     return f"{d.year - 1}-{d.year}"
 

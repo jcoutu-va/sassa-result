@@ -354,10 +354,10 @@ Distance normalization strips round suffixes (`400 (100) Round A` → `400 (100)
 
 ## Season Calculation
 
-The hockey-style season straddles two calendar years. The rule used throughout the codebase:
+The season straddles two calendar years, starting July 1. The rule used throughout the codebase:
 
-- Competition in **October–December** → season starts that calendar year (e.g. Oct 2024 → `2024-2025`)
-- Competition in **January–September** → season started the prior year (e.g. Mar 2025 → `2024-2025`)
+- Competition in **July–December** → season starts that calendar year (e.g. Oct 2024 → `2024-2025`)
+- Competition in **January–June** → season started the prior year (e.g. Mar 2025 → `2024-2025`)
 
 ---
 
