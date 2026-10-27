@@ -15,6 +15,10 @@ Admin endpoints (require Firebase ID token + admin_users entry):
   GET  /api/admin/users           list admin emails
   POST /api/admin/users           body: {email}
   DELETE /api/admin/users/<email> remove admin
+
+Batch endpoints (require ApiKey header):
+  POST /api/batch/best-times?from=&to=   CSV ssc_id+name → all best times per skater
+  POST /api/batch/pb-lookup?from=&to=    CSV ssc_id + ST/LT distance cols → PB per cell
 """
 
 import os
@@ -666,6 +670,123 @@ def batch_best_times():
                 ])
 
     filename = f"best-times-{from_date}-to-{to_date}.csv"
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/api/batch/pb-lookup", methods=["POST", "OPTIONS"])
+def batch_pb_lookup():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    _, err = _require_api_key()
+    if err:
+        return err
+
+    from_date = request.args.get("from", "").strip()
+    to_date   = request.args.get("to",   "").strip()
+    if not from_date or not to_date:
+        return jsonify({"error": "from and to query params required"}), 400
+
+    raw_csv    = request.get_data(as_text=True)
+    reader     = csv.DictReader(io.StringIO(raw_csv))
+    fieldnames = list(reader.fieldnames or [])
+
+    if "ssc_id" not in fieldnames:
+        return jsonify({"error": "CSV must have ssc_id column"}), 400
+
+    dist_cols = [f for f in fieldnames if re.match(r"^(ST|LT)-", f)]
+    if not dist_cols:
+        return jsonify({"error": "No distance columns found (expected ST-... or LT-... headers)"}), 400
+
+    def _parse_col(col):
+        idx = col.index("-")
+        return col[:idx], col[idx + 1:]   # track_type, distance
+
+    col_specs     = {col: _parse_col(col) for col in dist_cols}
+    unique_specs  = list({v for v in col_specs.values()})
+
+    input_rows = [r for r in reader if r.get("ssc_id", "").strip()]
+    if not input_rows:
+        return jsonify({"error": "No rows in CSV"}), 400
+
+    ssc_ids   = [r["ssc_id"].strip() for r in input_rows]
+    in_params = {f"id{i}": v for i, v in enumerate(ssc_ids)}
+    in_clause = ", ".join(f":id{i}" for i in range(len(ssc_ids)))
+
+    with engine.connect() as conn:
+        found_rows = conn.execute(
+            text(f"SELECT code_pat FROM skaters WHERE code_pat IN ({in_clause})"),
+            in_params,
+        ).fetchall()
+        found_ids = {r.code_pat for r in found_rows}
+
+        if found_ids:
+            dist_conds  = []
+            dist_params = {}
+            for i, (tt, dist) in enumerate(unique_specs):
+                dist_conds.append(
+                    f"(c.track_type = :tt{i} AND "
+                    f"REGEXP_REPLACE(r.distance, ' Round [A-Za-z0-9]+', '') = :dist{i})"
+                )
+                dist_params[f"tt{i}"]   = tt
+                dist_params[f"dist{i}"] = dist
+
+            result_params = {**in_params, **dist_params,
+                             "from_date": from_date, "to_date": to_date}
+
+            pb_rows = conn.execute(text(f"""
+                WITH ranked AS (
+                  SELECT
+                    s.code_pat,
+                    c.track_type,
+                    REGEXP_REPLACE(r.distance, ' Round [A-Za-z0-9]+', '') AS distance,
+                    r.time_display,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY s.code_pat, c.track_type,
+                                   REGEXP_REPLACE(r.distance, ' Round [A-Za-z0-9]+', '')
+                      ORDER BY r.time_ms
+                    ) AS rn
+                  FROM results r
+                  JOIN competitions c ON r.competition_id = c.id
+                  JOIN skaters s      ON r.skater_id      = s.id
+                  WHERE s.code_pat IN ({in_clause})
+                    AND r.is_valid_time = true
+                    AND r.qual_or_fin   = 'Fin'
+                    AND c.date BETWEEN :from_date AND :to_date
+                    AND ({" OR ".join(dist_conds)})
+                )
+                SELECT code_pat, track_type, distance, time_display AS best_time
+                FROM ranked WHERE rn = 1
+            """), result_params).fetchall()
+        else:
+            pb_rows = []
+
+    pb_index = {(r.code_pat, r.track_type, r.distance): r.best_time for r in pb_rows}
+
+    out    = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for row in input_rows:
+        ssc_id  = row["ssc_id"].strip()
+        out_row = dict(row)
+        out_row["ssc_id"] = ssc_id
+
+        if ssc_id not in found_ids:
+            for col in dist_cols:
+                out_row[col] = "NF"
+        else:
+            for col in dist_cols:
+                tt, dist = col_specs[col]
+                out_row[col] = pb_index.get((ssc_id, tt, dist)) or "N/A"
+
+        writer.writerow(out_row)
+
+    filename = f"pb-lookup-{from_date}-to-{to_date}.csv"
     return Response(
         out.getvalue(),
         mimetype="text/csv",
